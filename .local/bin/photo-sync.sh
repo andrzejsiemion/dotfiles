@@ -1,8 +1,6 @@
 #!/bin/zsh
 # --- Load Configuration ---
 SCRIPT_DIR="${0:A:h}"
-
-# --- Set env file ---
 ENV_FILE="${SCRIPT_DIR}/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "Error: Configuration file not found at $ENV_FILE"
@@ -17,11 +15,14 @@ if [[ -z "$BASE_SOURCE" ]] || [[ -z "$BASE_DESTINATION" ]]; then
     exit 1
 fi
 
-# Check if NAS destination exists (prevents writing to wrong location)
-if [[ ! -d "$BASE_DESTINATION" ]]; then
-    echo "CRITICAL ERROR: Destination $BASE_DESTINATION does not exist or is not mounted."
-    echo "Please mount your NAS and try again."
-    exit 1
+# More robust mount check
+if ! mount | grep -q "${BASE_DESTINATION%/}"; then
+    # Fallback: check if it's actually a directory on a mounted volume
+    if [[ ! -d "$BASE_DESTINATION" ]] || [[ "$(df "$BASE_DESTINATION" | tail -1 | awk '{print $1}')" == "$(df / | tail -1 | awk '{print $1}')" ]]; then
+        echo "CRITICAL ERROR: Destination $BASE_DESTINATION is not on a mounted volume."
+        echo "Please mount your NAS and try again."
+        exit 1
+    fi
 fi
 
 : ${LOG_DIR:="$HOME/Library/Logs/PhotoSync"}
@@ -40,16 +41,19 @@ fi
 # --- Parse Arguments ---
 YEAR=""
 DRY_RUN_FLAG=""
+SKIP_CATALOG=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     -y|--year) YEAR="$2"; shift 2 ;;
     -d|--dry-run) DRY_RUN_FLAG="--dry-run"; shift ;;
+    --no-catalog) SKIP_CATALOG=true; shift ;;
     -h|--help)
-      echo "Usage: $0 [-y|--year YEAR] [-d|--dry-run]"
+      echo "Usage: $0 [-y|--year YEAR] [-d|--dry-run] [--no-catalog]"
       echo ""
       echo "Options:"
       echo "  -y, --year YEAR    Sync specific year only"
       echo "  -d, --dry-run      Preview changes without syncing"
+      echo "  --no-catalog       Skip catalog synchronization"
       echo "  -h, --help         Show this help message"
       exit 0
       ;;
@@ -71,11 +75,11 @@ sync_folder() {
     
     "$RSYNC" -avh $DRY_RUN_FLAG \
         --size-only \
-		    --delete \
+        --delete \
+		--inplace \
         --info=progress2 \
         --stats \
-		    --inplace \
-		    --exclude='.DS_Store' \
+        --exclude='.DS_Store' \
         --exclude='._*' \
         --exclude='.Spotlight-V100' \
         --exclude='.Trashes' \
@@ -90,16 +94,18 @@ sync_folder() {
 # --- Setup Logging ---
 LOG_DIR=${LOG_DIR/#\~/$HOME}
 mkdir -p "$LOG_DIR"
-find "$LOG_DIR" -name "photo_sync_log_*.log" -mtime +30 -delete 2>/dev/null
+find "$LOG_DIR" -name "sync_log_*.log" -mtime +30 -delete 2>/dev/null
 
 LOG_NAME=${YEAR:-all}
-LOG_FILE="${LOG_DIR}/photo_sync_log_${LOG_NAME}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/sync_log_${LOG_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
 # --- Execution ---
 {
     echo "--- Photo Sync Tool ---"
     echo "[RSYNC]  Using: $RSYNC"
     echo "[DEST]   NAS: $BASE_DESTINATION"
+    echo "[DELETE] Enabled - files deleted from source will be removed from NAS"
+    [[ "$SKIP_CATALOG" == true ]] && echo "[CATALOG] Skipped (--no-catalog flag set)"
     [[ -n "$DRY_RUN_FLAG" ]] && echo "[MODE]   DRY RUN" || echo "[MODE]   LIVE SYNC"
     echo "=== Sync started at $(date) ==="
     
@@ -111,7 +117,7 @@ LOG_FILE="${LOG_DIR}/photo_sync_log_${LOG_NAME}_$(date +%Y%m%d_%H%M%S).log"
     fi
     
     # --- 2. Sync Catalogs ---
-    if [[ -n "$CATALOG" ]]; then
+    if [[ "$SKIP_CATALOG" == false && -n "$CATALOG" ]]; then
         local -a catalog_pairs
         catalog_pairs=("${(@s:,:)CATALOG}")
         for pair in "${catalog_pairs[@]}"; do
@@ -124,6 +130,8 @@ LOG_FILE="${LOG_DIR}/photo_sync_log_${LOG_NAME}_$(date +%Y%m%d_%H%M%S).log"
                 sync_folder "$cat_src" "$cat_dst" "Catalog: $(basename ${cat_src%/})"
             fi
         done
+    elif [[ "$SKIP_CATALOG" == true ]]; then
+        echo "\n[CATALOG] Skipping catalog sync (--no-catalog flag set)"
     fi
     
     echo "\n=== Final Summary ==="
